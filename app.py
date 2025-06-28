@@ -5,7 +5,6 @@ from datetime import date, datetime
 from io import BytesIO
 import base64
 import requests
-import google.generativeai as genai
 
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_sqlalchemy import SQLAlchemy
@@ -18,76 +17,45 @@ load_dotenv()
 # --- App aur Database ka Initial Setup ---
 app = Flask(__name__)
 
-# Database ka URL aur Secret Key environment variables se uthayenge
-# Render par yeh settings hum dashboard mein karenge
+# Database ka URL environment variable se uthayenge
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
-migrate = Migrate(app, db) # Database changes (migrations) ko handle karne ke liye
+migrate = Migrate(app, db)
 
-# --- Secret Keys ko Environment se Load Karna ---
+# --- Secret Keys ---
 GOOGLE_TTS_API_KEY = os.environ.get('GOOGLE_TTS_API_KEY')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') # Gemini ki key bhi add karni hogi
 
-# --- Plan ke hisab se daily limits ---
+# --- Plan Limits & Mood Presets ---
 PLAN_LIMITS = {
     'free': 3,
     'advanced': 100,
     'premium': 500
 }
 
+# Rule-based "Emotional" presets
+MOOD_PRESETS = {
+    'sad':      {'rate': 0.85, 'pitch': -4.0},
+    'angry':    {'rate': 1.1,  'pitch': -2.0},
+    'excited':  {'rate': 1.15, 'pitch': 2.0},
+    'default':  {'rate': 1.0,  'pitch': 0.0}
+}
+
 # --- Database Models (Tables ka Blueprint) ---
 
 class User(db.Model):
-    """User table ka structure define karta hai."""
     id = db.Column(db.Integer, primary_key=True)
-    uid = db.Column(db.String(120), unique=True, nullable=False) # Firebase se aayega
+    uid = db.Column(db.String(120), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    plan_type = db.Column(db.String(50), default='free', nullable=False) # 'free', 'advanced', 'premium'
+    plan_type = db.Column(db.String(50), default='free', nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class GenerationLog(db.Model):
-    """Har user ki daily voice generation ka hisaab rakhta hai."""
     id = db.Column(db.Integer, primary_key=True)
     user_uid = db.Column(db.String(120), nullable=False)
     generation_date = db.Column(db.Date, nullable=False, default=date.today)
     count = db.Column(db.Integer, default=0, nullable=False)
-
-# --- Helper Function: Gemini se Emotional SSML Banwana ---
-
-def get_emotional_ssml(text_to_convert):
-    """Saada text ko emotional SSML mein convert karta hai."""
-    try:
-        if not GEMINI_API_KEY:
-            # Agar Gemini ki key set nahi hai, toh saada text hi use karo
-            return f"<speak>{text_to_convert}</speak>"
-            
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        prompt = f"""
-        Analyze the sentiment of the following text and convert it into SSML 
-        to make it sound natural and emotional. Use <prosody>, <emphasis>, 
-        and <break> tags effectively. Only output the final SSML string, 
-        wrapped in <speak> tags.
-
-        TEXT: "{text_to_convert}"
-        """
-        
-        response = model.generate_content(prompt)
-        ssml_text = response.text.strip()
-        
-        if ssml_text.startswith("<speak>") and ssml_text.endswith("</speak>"):
-            return ssml_text
-        else:
-            # Fallback agar Gemini sahi format na de
-            return f"<speak>{text_to_convert}</speak>"
-
-    except Exception as e:
-        print(f"Error calling Gemini API: {e}")
-        # Error ki soorat mein bhi saada text use karo
-        return f"<speak>{text_to_convert}</speak>"
 
 # --- API Endpoints ---
 
@@ -124,7 +92,8 @@ def get_user_status(uid):
 def verify_purchase():
     """Google Play se aayi purchase ko verify karke user ka plan upgrade karta hai."""
     data = request.json
-    uid, new_plan = data.get('uid'), data.get('plan_type')
+    uid = data.get('uid')
+    new_plan = data.get('plan_type')
 
     # Yahan Google Play Developer API se token verify karne ka asal logic aayega
     is_verified = True # Abhi ke liye hum isko 'True' maan lete hain
@@ -140,7 +109,7 @@ def verify_purchase():
 
 @app.route('/speak', methods=['POST'])
 def speak():
-    """Main voice generation endpoint with Gatekeeper and Gemini logic."""
+    """Main voice generation endpoint with Gatekeeper and Mood logic."""
     data = request.json
     uid = data.get('uid')
     ad_proof = data.get('ad_proof_token')
@@ -170,15 +139,27 @@ def speak():
     db.session.commit()
     # --- Gatekeeper Logic End ---
 
-    final_ssml_text = get_emotional_ssml(data.get("text", ""))
+    # --- Mood ke Hisab se Pitch/Rate Set Karna ---
+    selected_mood = data.get("mood", "default")
+    preset = MOOD_PRESETS.get(selected_mood, MOOD_PRESETS['default'])
+    
+    speaking_rate = preset['rate']
+    pitch = preset['pitch']
+    
+    text_to_speak = data.get("text", "")
+    voice_name = data.get("voice", "en-US-Wavenet-D")
 
     payload = {
-        "input": {"ssml": final_ssml_text},
+        "input": {"text": text_to_speak},
         "voice": {
-            "languageCode": "-".join(data.get("voice", "en-US-Wavenet-D").split("-")[:2]),
-            "name": data.get("voice", "en-US-Wavenet-D")
+            "languageCode": "-".join(voice_name.split("-")[:2]),
+            "name": voice_name
         },
-        "audioConfig": {"audioEncoding": "MP3"}
+        "audioConfig": {
+            "audioEncoding": "MP3",
+            "speakingRate": speaking_rate,
+            "pitch": pitch
+        }
     }
 
     try:
@@ -189,7 +170,6 @@ def speak():
         audio_content = response.json().get("audioContent")
         audio_bytes = BytesIO(base64.b64decode(audio_content))
         
-        # Audio ke sath-sath header mein credits bhi wapas bhejte hain
         final_response = make_response(send_file(audio_bytes, mimetype="audio/mpeg"))
         final_response.headers['X-Remaining-Credits'] = current_limit - log.count
         return final_response
