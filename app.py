@@ -1,5 +1,3 @@
-# app.py
-
 import os
 from datetime import date, datetime
 from io import BytesIO
